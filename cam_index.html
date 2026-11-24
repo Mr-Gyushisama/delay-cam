@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>遅延再生カメラ</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1117;--ink:#f2f4f7;--sub:#9aa4b2;--acc:#ff7a1a;--panel:#161c24}
+*{box-sizing:border-box;min-width:0}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,"Hiragino Sans",sans-serif;overflow:hidden}
+#stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
+#view{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain}
+#live{position:absolute;right:max(12px,env(safe-area-inset-right));top:max(12px,env(safe-area-inset-top));width:22%;max-width:220px;border:2px solid #fff6;border-radius:8px;background:#000}
+#badge{position:absolute;left:max(12px,env(safe-area-inset-left));top:max(12px,env(safe-area-inset-top));background:#000a;padding:6px 12px;border-radius:999px;font-weight:700;font-variant-numeric:tabular-nums}
+#badge b{color:var(--acc)}
+#msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;font-size:clamp(28px,6vw,64px);font-weight:800;pointer-events:none;text-shadow:0 2px 12px #000}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:10px max(12px,env(safe-area-inset-left)) max(10px,env(safe-area-inset-bottom));background:linear-gradient(transparent,#000d 30%);display:flex;flex-wrap:wrap;gap:10px;align-items:center;transition:opacity .3s}
+#bar.hide{opacity:0;pointer-events:none}
+button,select{font:inherit;font-size:16px;min-height:44px;padding:0 16px;border-radius:10px;border:1px solid #ffffff33;background:var(--panel);color:var(--ink)}
+button.main{background:var(--acc);border-color:var(--acc);color:#111;font-weight:800}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.delay{display:flex;align-items:center;gap:8px;flex:1 1 260px}
+.delay input{flex:1;accent-color:var(--acc);height:44px}
+.delay output{min-width:4.5em;text-align:right;font-weight:800;font-variant-numeric:tabular-nums}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px;text-align:center;background:var(--bg);z-index:5}
+#start h1{font-size:clamp(30px,5vw,48px);line-height:1.1;margin:0}
+#start p{color:var(--sub);max-width:34em;margin:0}
+#start .main{font-size:20px;padding:0 32px;min-height:56px}
+#err{color:#ff8a8a}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <video id="live" playsinline muted autoplay></video>
+  <div id="badge">遅延 <b id="bd">5.0</b> 秒</div>
+  <div id="msg"></div>
+</div>
+
+<div id="bar">
+  <button id="go" class="main">一時停止</button>
+  <div class="delay"><label for="dl">遅延</label><input id="dl" type="range" min="1" max="15" step="0.5" value="5"><output id="dlo">5.0 秒</output></div>
+  <button id="flip">カメラ切替</button>
+  <button id="mir">左右反転：オフ</button>
+  <select id="q" aria-label="画質">
+    <option value="640">画質：軽い</option>
+    <option value="960" selected>画質：標準</option>
+    <option value="1280">画質：高い</option>
+  </select>
+  <button id="pv">小窓：表示</button>
+  <button id="hide">操作を隠す</button>
+</div>
+
+<div id="start">
+  <h1>遅延再生カメラ</h1>
+  <p>カメラの映像を数秒遅れて表示します。スイングしてから画面を見れば、今のフォームを確認できます。映像は端末内だけで処理し、保存・送信はしません。</p>
+  <button id="begin" class="main">カメラを開始</button>
+  <p id="err"></p>
+</div>
+
+<script>
+{
+const $ = id => document.getElementById(id);
+const video = $('live'), view = $('view'), vctx = view.getContext('2d');
+const cap = document.createElement('canvas'), cctx = cap.getContext('2d');
+const FPS = 30;
+let delay = 5, facing = 'environment', mirror = false, width = 960;
+let stream = null, frames = [], paused = false, timer = null, shownT = -1, decoding = false;
+
+const load = () => { try { const s = JSON.parse(localStorage.getItem('delaycam') || '{}');
+  if (s.delay) delay = s.delay; if (s.facing) facing = s.facing; if (s.mirror) mirror = s.mirror; if (s.width) width = s.width; } catch (e) {} };
+const save = () => { try { localStorage.setItem('delaycam', JSON.stringify({ delay, facing, mirror, width })); } catch (e) {} };
+
+function syncUI() {
+  $('dl').value = delay; $('dlo').textContent = delay.toFixed(1) + ' 秒'; $('bd').textContent = delay.toFixed(1);
+  $('mir').textContent = '左右反転：' + (mirror ? 'オン' : 'オフ');
+  $('q').value = String(width);
+  view.style.transform = mirror ? 'scaleX(-1)' : '';
+  video.style.transform = mirror ? 'scaleX(-1)' : '';
+}
+
+async function openCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  frames = []; shownT = -1;
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: FPS } }
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function capture() {
+  if (paused || video.readyState < 2 || !video.videoWidth) return;
+  const w = Math.min(width, video.videoWidth), h = Math.round(w * video.videoHeight / video.videoWidth);
+  if (cap.width !== w || cap.height !== h) { cap.width = w; cap.height = h; }
+  cctx.drawImage(video, 0, 0, w, h);
+  const t = performance.now();
+  cap.toBlob(b => { if (b) frames.push({ t, b }); }, 'image/jpeg', 0.75);
+}
+
+function render() {
+  requestAnimationFrame(render);
+  if (paused || !stream) return;
+  const target = performance.now() - delay * 1000;
+  // 表示すべきフレーム = target 以前で最新のもの
+  let i = -1;
+  for (let k = 0; k < frames.length && frames[k].t <= target; k++) i = k;
+  if (i > 0) frames.splice(0, i); // 古いフレームを捨ててメモリを抑える
+  const f = frames[0];
+  const remain = frames.length ? (frames[0].t - target) / 1000 : delay;
+  $('msg').textContent = (!f || f.t > target) ? '準備中… あと ' + Math.max(0, Math.ceil(remain)) + ' 秒' : '';
+  if (!f || f.t > target || f.t === shownT || decoding) return;
+  decoding = true;
+  createImageBitmap(f.b).then(img => {
+    if (view.width !== img.width || view.height !== img.height) { view.width = img.width; view.height = img.height; }
+    vctx.drawImage(img, 0, 0); img.close && img.close(); shownT = f.t;
+  }).catch(() => {}).finally(() => { decoding = false; });
+}
+
+async function begin() {
+  $('err').textContent = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('err').textContent = 'このブラウザではカメラを使えません。https のページをSafariで開いてください。'; return;
+  }
+  try {
+    await openCamera();
+    $('start').style.display = 'none';
+    if (!timer) { timer = setInterval(capture, 1000 / FPS); requestAnimationFrame(render); }
+  } catch (e) {
+    $('err').textContent = 'カメラを開始できませんでした（' + (e.name || 'エラー') + '）。カメラの許可と、https で開いているかを確認してください。';
+  }
+}
+
+$('begin').addEventListener('click', begin);
+$('dl').addEventListener('input', e => { delay = parseFloat(e.target.value); syncUI(); save(); });
+$('go').addEventListener('click', () => {
+  paused = !paused; $('go').textContent = paused ? '再開' : '一時停止';
+  if (!paused) { frames = []; shownT = -1; }
+});
+$('flip').addEventListener('click', async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  mirror = facing === 'user'; syncUI(); save();
+  try { await openCamera(); } catch (e) { $('msg').textContent = 'カメラを切り替えられませんでした'; }
+});
+$('mir').addEventListener('click', () => { mirror = !mirror; syncUI(); save(); });
+$('q').addEventListener('change', e => { width = parseInt(e.target.value, 10); frames = []; shownT = -1; save(); });
+$('pv').addEventListener('click', () => {
+  const on = video.style.display !== 'none';
+  video.style.display = on ? 'none' : ''; $('pv').textContent = '小窓：' + (on ? '非表示' : '表示');
+});
+$('hide').addEventListener('click', () => $('bar').classList.add('hide'));
+$('stage').addEventListener('click', () => $('bar').classList.remove('hide'));
+document.addEventListener('visibilitychange', () => { if (document.hidden) { frames = []; shownT = -1; } });
+
+load(); syncUI();
+}
+</script>
+</body>
